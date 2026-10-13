@@ -117,8 +117,37 @@ Decisions: [1] NA fix = YES (done). [2] blank region = BACKFILL per-customer. [3
   - Reconciliation all PASS: rows 2660 (2676−16 dupes), seats=31,217, value=$40,385,112, customers=327, no blank regions, arr logic correct.
   - loaded as text in L1; typed here (seats int, money float, sold_date datetime).
 
-## Current status / next step
-- A is clean. Next: **L2 Product B** (CAD subscriptions) — harder: multi-currency (USD/GBP/EUR → need FX), mixed date formats, quoted commas, status/is_renewal, dup contract_no.
-- Decisions likely needed for B: FX rates/as-of, date parsing strategy, dup policy, active/status mapping.
-- Still parked for L3: active-rule (end_date/is_active), customer identity across sources.
+- **L2 Product B — DONE ✅** (`src/etl/transform/product_b.py`) — 1,115 rows, all 15 reconciliation checks pass.
+  - Decisions: [1] currency→USD at BOOKING-date rate; [2] mixed dates parsed by `/` vs `-`; [3] 4 exact dup contract_nos dropped (0 conflicts); [4] status normalized.
+  - **FX** (`src/etl/fx.py`): yfinance pulled GBPUSD/EURUSD once → cached `data/reference/fx_rates.csv` (1828 daily rows, weekends ffill/bfill). `to_usd()` converts per-row at booking date. Reproducible, no live API on each run.
+  - Lesson: EUR dipped below USD parity in 2022 → conversions can go DOWN; reconcile against the rate table, not a directional assumption.
+  - **Renewal inference** ([[etl-lab-ground-rules]] "default to me / be certain"): 36 blank `is_renewal` filled by rule "customer has a prior contract ending within 1 day of this start". Validated vs 1,079 known labels: precision 98.76%, recall 100%, 6 FPs. Known labels kept verbatim; only blanks filled; flagged via new `is_renewal_inferred` col. 21→new, 15→renewal.
+  - Schema additions: `cancel_date`, `is_renewal`, `is_renewal_inferred` (A/C carry nulls via superset principle). Re-ran A → both CSVs now identical 22-col schema.
+- Caught a boolean-dtype bug mid-analysis (`~` on object column) that gave fake precision 0.50; recomputed correctly → 98.76%. Lesson: cast to bool before set ops.
+
+- **L2 Product C — DONE ✅** (`src/etl/transform/product_c.py`) — 375 rows, all 10 reconciliation checks pass.
+  - Detect header row dynamically (not hardcoded); keep only `SO-` rows → drops preamble/blanks/TOTAL footer.
+  - Seats: strip "4 seats"→4 (103 rows). Discounts exist (0/5/10/15%) so order_total != seats*unit; check is total<=seats*unit. Footer TOTAL 9,158,875 reconciles exactly.
+  - Decision: C has NO customer_name/region cols → left null, ENRICH in L3 from A by Customer ID (195/206 match; 11 C-only customers TBD in L3).
+  - **Date imputation (B-style rigor):** 16 blank Order Dates filled by interpolating against order-ref sequence (corr 0.98; LOO median err ~9d, p90 20d). Flagged `booking_date_inferred=True`. User explored ffill/bfill but 148 inversions + 2 inverted brackets → interpolation chosen. Not day-exact; fine at quarter grain.
+  - Schema additions: `booking_date_inferred`. Made both `_inferred` flags explicit (False by default) across A/B/C.
+- **L2 COMPLETE.** All 3 clean CSVs in data/processed, identical 23-col schema. Rows: A=2660, B=1115, C=375 (total 4150).
+
+## L3 prep — customer identity (explored, not yet built)
+Problem: report "by company" but IDs don't align. A↔C share `C-100xx` (easy). B uses numeric `account_number` → must match B↔A by NAME (dirty: casing, legal suffixes, typos like "Cascade Aerosace").
+User's plan (validated as textbook fuzzy entity resolution): normalize → high-threshold (95-99%) match → manual-review the gray band.
+Findings from exploration:
+- Normalization (lowercase, strip punct, strip legal suffixes corp/inc/llc/gmbh/ltd/...) → **145/184 B customers EXACT-match A**; ~39 left for fuzzy/review.
+- ⚠️ FALSE-MERGE trap: 93 norm-name collision GROUPS in A (distinct ids → same norm), e.g. Cascade Tooling Corp/GmbH/Ltd = different regional entities. Suffixes track REGION.
+- Fix: match on **normalized_name + region** (we have region both sides) → collisions 93 → **10**.
+- 🐛 FOUND: A's `customer_name` has the SAME blank-backfill gap as region — 83 blank cells / 71 customers, ALL recoverable from the same customer's other rows (0 conflicts, 0 truly nameless). We backfilled region in A but FORGOT customer_name. Mirror the region backfill.
+- Reminder: reading the clean CSVs re-triggers the "NA"→NaN bug → always read with keep_default_na=False, na_values=[].
+- rapidfuzz NOT installed yet (needed for the ~39 fuzzy matches).
+
+## Current status / next step (identity, in order)
+1. FIX A transform: backfill `customer_name` per customer_id (mirror region). Re-run A.
+2. Build normalizer; match B→A on (norm_name, region); auto-accept exact.
+3. Install rapidfuzz; fuzzy-match the ~39 residual; route gray band to review.
+4. Assign a canonical customer_id/key across sources; enrich C's name/region from A by Customer ID.
+Then: **active-rule** (status/is_active for A & C) → **L3 UNIFY** (concat A+B+C).
 - Still to lock before L3 stack: active-rule, company identity.

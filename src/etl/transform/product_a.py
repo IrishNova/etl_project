@@ -92,6 +92,9 @@ def transform_product_a(raw: pd.DataFrame) -> pd.DataFrame:
             "revenue_type": revenue_type,
             "status": pd.NA,                    # set once active-rule is locked
             "is_active": pd.NA,                 # set once active-rule is locked
+            "is_renewal": pd.NA,                # not applicable to A
+            "is_renewal_inferred": False,
+            "booking_date_inferred": False,     # A dates are all source-given
             "source_file": PRODUCT_A_PATH.name,
             "loaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }

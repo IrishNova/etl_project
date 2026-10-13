@@ -21,6 +21,7 @@ UNIFIED_COLUMNS: list[str] = [
     "booking_date",       # when it was sold — drives bookings / TTM
     "start_date",         # coverage start
     "end_date",           # coverage end; null = perpetual / one-off
+    "cancel_date",        # when cancelled, if ever (drives churn timing)
     # --- measures ---
     "seats",              # normalised integer
     "currency_orig",      # what the source charged in
@@ -31,6 +32,9 @@ UNIFIED_COLUMNS: list[str] = [
     "revenue_type",       # recurring / one-time
     "status",             # active / expired / cancelled (set once active-rule is locked)
     "is_active",          # bool as-of a reference date (set with active-rule)
+    "is_renewal",         # was this a renewal of a prior contract? (drives churn/retention)
+    "is_renewal_inferred",# True if is_renewal was imputed (source blank), not source-given
+    "booking_date_inferred",  # True if booking_date was imputed (source blank)
     "source_file",        # provenance
     "loaded_at",          # audit timestamp
 ]
