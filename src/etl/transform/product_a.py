@@ -31,22 +31,23 @@ REVENUE_TYPE_BY_LICENSE = {
 }
 
 
-def _backfill_region(df: pd.DataFrame) -> pd.Series:
-    """Fill blank region from the same customer's known region.
+def _backfill_from_customer(df: pd.DataFrame, col: str, fallback: str) -> pd.Series:
+    """Fill a column's blanks from the same customer's known value for it.
 
-    Verified safe: every blank-region customer has exactly one known region
-    elsewhere, with no conflicts. An "Unknown" fallback guards the (currently
-    empty) case of a customer with no region anywhere.
+    Verified safe for both region and customer_name: every blank-valued
+    customer has exactly one known value elsewhere, with no conflicts. The
+    `fallback` guards the (currently empty) case of a customer with no value
+    anywhere, so nothing is ever invented.
     """
     known = (
-        df[df["region"] != ""]
-        .groupby("cust_id")["region"]
+        df[df[col] != ""]
+        .groupby("cust_id")[col]
         .agg(lambda s: s.mode().iat[0])
     )
-    filled = df["region"].copy()
+    filled = df[col].copy()
     blank = filled == ""
     filled.loc[blank] = df.loc[blank, "cust_id"].map(known)
-    return filled.replace("", "Unknown").fillna("Unknown")
+    return filled.replace("", fallback).fillna(fallback)
 
 
 def transform_product_a(raw: pd.DataFrame) -> pd.DataFrame:
@@ -60,10 +61,11 @@ def transform_product_a(raw: pd.DataFrame) -> pd.DataFrame:
     df["net_amount_usd"] = pd.to_numeric(df["net_amount_usd"], errors="raise")
     df["sold_date"] = pd.to_datetime(df["sold_date"], format="%Y-%m-%d", errors="raise")
 
-    # --- CLEAN: whitespace + region backfill ---
+    # --- CLEAN: whitespace + backfill blanks from the same customer ---
     df["customer_name"] = df["customer_name"].str.strip()
     df["region"] = df["region"].str.strip()
-    df["region"] = _backfill_region(df)
+    df["customer_name"] = _backfill_from_customer(df, "customer_name", fallback="Unknown")
+    df["region"] = _backfill_from_customer(df, "region", fallback="Unknown")
 
     # --- DERIVE: revenue_type + arr ---
     revenue_type = df["license_type"].map(REVENUE_TYPE_BY_LICENSE)
@@ -71,6 +73,14 @@ def transform_product_a(raw: pd.DataFrame) -> pd.DataFrame:
         bad = sorted(df.loc[revenue_type.isna(), "license_type"].unique())
         raise ValueError(f"Unmapped license_type values: {bad}")
     arr = df["net_amount_usd"].where(revenue_type == "recurring", 0.0)
+
+    # --- DERIVE: coverage window end_date ---
+    # Maintenance Renewal = 1-year term from start. Perpetual has no term (NaT).
+    # This is the only real new fact; is_active is NOT stored — it's computed at
+    # view time from [start_date, end_date] by active_as_of() for a chosen date.
+    end_date = (df["sold_date"] + pd.DateOffset(years=1)).where(
+        revenue_type == "recurring", pd.NaT
+    )
 
     # --- MAP: onto the unified schema ---
     out = pd.DataFrame(
@@ -83,15 +93,15 @@ def transform_product_a(raw: pd.DataFrame) -> pd.DataFrame:
             "region": df["region"],
             "booking_date": df["sold_date"],
             "start_date": df["sold_date"],
-            "end_date": pd.NaT,                 # A has no term; set with active-rule
+            "end_date": end_date,               # maintenance = +1yr; perpetual = NaT
             "seats": df["seats"],
             "currency_orig": "USD",
             "value_orig": df["net_amount_usd"],
             "booking_value_usd": df["net_amount_usd"],
             "arr_usd": arr,
             "revenue_type": revenue_type,
-            "status": pd.NA,                    # set once active-rule is locked
-            "is_active": pd.NA,                 # set once active-rule is locked
+            "status": pd.NA,                    # derived at view time (not a stored fact)
+            "is_active": pd.NA,                 # derived at view time by active_as_of()
             "is_renewal": pd.NA,                # not applicable to A
             "is_renewal_inferred": False,
             "booking_date_inferred": False,     # A dates are all source-given
@@ -125,6 +135,11 @@ def reconcile(raw: pd.DataFrame, clean: pd.DataFrame) -> None:
         == round(after["sum_net_amount_usd"], 2),
         "distinct customers preserved": before["nunique_cust_id"] == after["nunique_cust_id"],
         "no blank/null regions": (clean["region"].notna() & (clean["region"] != "")).all(),
+        "no blank/null customer names": (
+            clean["customer_name"].notna() & (clean["customer_name"] != "")
+        ).all(),
+        "no names invented (all names appear in source)": set(clean["customer_name"])
+        <= set(raw["customer_name"].str.strip()) | {"Unknown"},
         "arr == value for recurring only": round(
             float(clean.loc[clean["revenue_type"] == "recurring", "booking_value_usd"].sum()), 2
         )
@@ -133,6 +148,16 @@ def reconcile(raw: pd.DataFrame, clean: pd.DataFrame) -> None:
             clean.loc[clean["revenue_type"] == "one-time", "arr_usd"].sum()
         )
         == 0.0,
+        "recurring has a 1yr window": bool(
+            (
+                clean.loc[clean["revenue_type"] == "recurring", "end_date"]
+                == clean.loc[clean["revenue_type"] == "recurring", "start_date"]
+                + pd.DateOffset(years=1)
+            ).all()
+        ),
+        "one-time/perpetual has no end_date": bool(
+            clean.loc[clean["revenue_type"] == "one-time", "end_date"].isna().all()
+        ),
     }
     print("\nCHECKS")
     for name, ok in checks.items():

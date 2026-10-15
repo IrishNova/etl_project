@@ -145,9 +145,62 @@ Findings from exploration:
 - rapidfuzz NOT installed yet (needed for the ~39 fuzzy matches).
 
 ## Current status / next step (identity, in order)
-1. FIX A transform: backfill `customer_name` per customer_id (mirror region). Re-run A.
-2. Build normalizer; match B→A on (norm_name, region); auto-accept exact.
-3. Install rapidfuzz; fuzzy-match the ~39 residual; route gray band to review.
-4. Assign a canonical customer_id/key across sources; enrich C's name/region from A by Customer ID.
-Then: **active-rule** (status/is_active for A & C) → **L3 UNIFY** (concat A+B+C).
-- Still to lock before L3 stack: active-rule, company identity.
+1. ✅ DONE — A `customer_name` backfilled (71 recovered, 0 blank, 0 invented, 327 ids↔327 names). Generalized `_backfill_from_customer(df,col,fallback)` now serves both region & name. +2 reconciliation checks.
+2. ✅ DONE — matcher built (`src/etl/unify/names.py`, `customer_match.py`). Match B→A on (norm_name, region). Result: **83 exact / 35 ambiguous / 66 unmatched** (crosswalk → data/processed/customer_crosswalk.csv).
+   - KEY FINDING: A has distinct customers sharing base-name+region, differing only by legal suffix (e.g. Quantum Aerospace Corp/Inc/LLC all NA). Suffix-stripping erases the only distinguisher → those 35 are GENUINELY ambiguous (B's suffix isn't among A's variants), correctly flagged for review not guessed. Full-name+region is unique in A (0 collisions) but doesn't resolve the 35 either.
+   - Canonical key = A's customer_id; matched B adopts it. Crosswalk has match_method for audit.
+3. ✅ DONE — rapidfuzz fuzzy pass (token_sort_ratio, within-region). Clean score gap (real typos ≥96, different-cos ≤83, nothing between) → threshold = 90.
+4. ✅ DONE — **MODEL DECISION: adopted Model 2 (company grain).** Tested both end-to-end: Model 1 (legal entity) = 97.3% resolved, 5 stuck ambiguous; **Model 2 (company = normalized base name + region) = 100% resolved, 0 ambiguous.** Model 2 matches the "by company" reporting goal; legal entity kept as detail.
+   - Rebuilt `customer_match.py` for Model 2. `build_customer_crosswalk()` → `data/processed/customer_crosswalk.csv` (717 customer rows → **334 companies**).
+     - A: 327 exact. B: 118 exact / 5 fuzzy / 61 B-only. C: 195 id-join (inherit A company by customer_id) / 11 c_only_unmatched.
+     - `company_id = norm_base|region`; cols: company_name, match_method, match_score, needs_review, company_legal_entities.
+   - **needs_review flag = 16** (5 fuzzy + 11 C-only with no name anywhere). This is the HOOK for the future build to trigger a manual-review notification on ambiguous names (user-requested).
+
+## Customer identity — DONE ✅ (Model 2).
+
+## active-rule — DONE ✅
+KEY INSIGHT (user-driven): `is_active` is NOT a stored fact — it depends on the
+date you ask about. Same license is active in June, expired in Dec. So we store
+only the immutable coverage window in L3 and COMPUTE is_active at view time (L4).
+- Decisions locked: maintenance (A) `end_date = start + 1yr`; perpetual (A) + one-time
+  (C) have no window → is_active = <NA> ("n/a"). Only recurring rows can be active.
+- Product A updated (`product_a.py`): built `end_date` for Maintenance Renewal rows
+  (+1yr), NaT for perpetual. +2 reconciliation checks. is_active/status stay <NA>
+  (derived at view time, not baked). Re-ran, all 11 checks pass.
+- **NEW L4 helper** `src/etl/views/active.py` → `active_as_of(df, as_of)` returns
+  `status_asof` {future/active/expired/cancelled/n/a} + nullable-bool `is_active`.
+  Rule: future < start; cancelled if cancel_date<=as_of; active if start<=as_of<=end;
+  else expired. Non-recurring → n/a.
+- Only B has cancellation (source: 489 active / 604 expired / 26 cancelled, cancel_date
+  on the 26). A/C have none. B's `status` = vendor ground truth.
+- VALIDATED: B's snapshot date reverse-engineered to **2026-09-30** (expired ends
+  <=09-29, active ends >=10-01, clean gap). `validate_against_b()` runs the rule at
+  that date → reproduces B's labels **1115/1115, zero mismatch**. Rule is trusted.
+  (Note: today 2026-10-15 is OUTSIDE B's window — proves as-of must be a parameter.)
+
+## L3 UNIFY — DONE ✅  (`src/etl/unify/build_fact.py`)
+THE SINGLE SOURCE OF TRUTH: `data/processed/unified_fact.csv` — **4,146 rows x 26 cols**,
+one row per contract. All 8 reconciliation checks pass; $83,035,467 reconciles exactly.
+- Stack = concat of the 3 conformed clean CSVs (schema-checked), then 2 enrichments:
+  1. company_id via crosswalk join on (product, customer_id). Every A/B row + 360 C rows
+     get one; only the 11 C-only stay null (flagged needs_review).
+  2. C's customer_name/region inherited from A by shared C-100xx customer_id.
+- status/is_active left AS STATED by source (B=vendor label; A/C=<NA>). NOT the canonical
+  activity answer — use views.active.active_as_of(df, date) for any date. Stored window
+  (start/end/cancel) is what powers that.
+- 47 rows flagged needs_review (B fuzzy-matched + C-only) — the manual-review hook.
+
+### Bugs caught & fixed building L3
+- 🐛 Product C never de-duplicated (A & B both do)! Found 4 exact-dup order rows (same SO-
+  ref = primary key). DROPPED → C 375→371 rows, total $9,158,875→$9,029,085. Footer still
+  reconciles: raw SO rows == footer; clean == footer - dup_total ($129,790). User OK'd drop.
+  Rebuilt C + crosswalk. Added `contract_id now unique` check.
+- 🐛 Join dtype: B customer_id reads as int64, crosswalk source_customer_id is str → no
+  match (all B company_id null). Fix: cast fact customer_id to str before merge.
+- 🐛 crosswalk NA company_id -> "" in CSV; we read na_values=[] (to protect region "NA"),
+  so "" came back as string not NaN -> 11 C-only looked "matched". Fix: replace ""->NA
+  after merge for company_id/company_name.
+
+## Next: L4 VIEWS (the payoff — cut views off the fact table)
+- licenses-outstanding + churn (uses active_as_of at a chosen snapshot).
+- then dashboard (Flask vs Tableau — TBD) and Phase 3 projections.

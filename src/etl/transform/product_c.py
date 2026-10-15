@@ -12,8 +12,10 @@ Decision locked (see PROGRESS.md): C has no customer_name/region columns, so
 those stay null here and are ENRICHED in L3 from A by Customer ID (same
 C-100xx scheme). 11 C-only customers can't be named by id -> handled in L3.
 
-Reconciliation anchor: the source's own `TOTAL` footer (9,158,875) must equal
-SUM(booking_value_usd) over the clean rows.
+Reconciliation anchor: the source's own `TOTAL` footer (9,158,875) is the sum of
+the RAW order rows, which include 4 exact-duplicate records. We drop those 4, so
+the clean total is footer - dup_total; the footer still reconciles against the
+raw (pre-dedup) rows, proving nothing real was lost.
 """
 
 from __future__ import annotations
@@ -90,6 +92,10 @@ def transform_product_c(raw: pd.DataFrame) -> pd.DataFrame:
     # Keep only real order rows -> drops blank spacers and the TOTAL footer.
     df = df[df["Order Ref"].astype(str).str.startswith("SO-")].copy()
 
+    # --- CLEAN: drop 4 exact-duplicate order rows (byte-identical, same SO- ref,
+    # which is the primary key -> a real second order would have its own ref). ---
+    df = df.drop_duplicates(keep="first")
+
     # --- CLEAN: types ---
     df["Seats"] = _seats_to_int(df["Seats"])
     df["Order Total (USD)"] = pd.to_numeric(df["Order Total (USD)"], errors="raise")
@@ -130,21 +136,38 @@ def transform_product_c(raw: pd.DataFrame) -> pd.DataFrame:
     return conform(out)
 
 
+def _raw_so_rows(raw: pd.DataFrame) -> pd.DataFrame:
+    """The raw order rows (pre-dedup), used to reconcile against the footer."""
+    hdr = _locate_header(raw)
+    df = raw.iloc[hdr + 1 :].copy()
+    df.columns = raw.iloc[hdr].tolist()
+    return df[df["Order Ref"].astype(str).str.startswith("SO-")].copy()
+
+
 def reconcile(raw: pd.DataFrame, clean: pd.DataFrame) -> None:
     footer = _footer_total(raw)
 
-    before = profile(clean, value_cols=("seats", "booking_value_usd"), key_col="customer_id")
+    so = _raw_so_rows(raw)
+    raw_total = float(pd.to_numeric(so["Order Total (USD)"], errors="raise").sum())
+    dup_total = float(
+        pd.to_numeric(so[so.duplicated(keep="first")]["Order Total (USD)"], errors="raise").sum()
+    )
+    clean_total = float(clean["booking_value_usd"].sum())
+    n_dropped = len(so) - len(clean)
+
     compare(
-        {"rows": 375, "footer_total_usd": footer},
-        {"rows": before["rows"], "footer_total_usd": float(clean["booking_value_usd"].sum())},
-        label="Product C (source footer vs clean)",
+        {"raw_rows": len(so), "raw_total_usd": raw_total, "footer_usd": footer},
+        {"clean_rows": len(clean), "clean_total_usd": clean_total, "dup_total_usd": dup_total},
+        label="Product C (raw vs clean; footer includes 4 dupes)",
     )
 
     checks = {
-        "375 order rows": len(clean) == 375,
-        "value total == footer TOTAL": round(float(clean["booking_value_usd"].sum()), 2)
-        == round(footer, 2),
+        "371 clean order rows": len(clean) == 371,
+        "4 exact dupes dropped": n_dropped == 4,
+        "raw SO total == footer TOTAL": round(raw_total, 2) == round(footer, 2),
+        "clean total == footer - dupes": round(clean_total, 2) == round(footer - dup_total, 2),
         "no junk leaked (all SO- ids)": clean["contract_id"].str.startswith("SO-").all(),
+        "contract_id now unique": not clean["contract_id"].duplicated().any(),
         "seats all positive ints": (clean["seats"] > 0).all(),
         "booking_date fully populated": clean["booking_date"].notna().all(),
         "16 dates imputed": int(clean["booking_date_inferred"].sum()) == 16,
