@@ -67,6 +67,10 @@ def transform_product_a(raw: pd.DataFrame) -> pd.DataFrame:
     df["customer_name"] = _backfill_from_customer(df, "customer_name", fallback="Unknown")
     df["region"] = _backfill_from_customer(df, "region", fallback="Unknown")
 
+    # --- CLEAN: normalize SKU — source has case drift (ia-core vs IA-CORE). SKUs
+    # are codes, so canonical form is upper-cased + stripped. ---
+    df["sku"] = df["sku"].str.strip().str.upper()
+
     # --- DERIVE: revenue_type + arr ---
     revenue_type = df["license_type"].map(REVENUE_TYPE_BY_LICENSE)
     if revenue_type.isna().any():
@@ -138,6 +142,9 @@ def reconcile(raw: pd.DataFrame, clean: pd.DataFrame) -> None:
         "no blank/null customer names": (
             clean["customer_name"].notna() & (clean["customer_name"] != "")
         ).all(),
+        "product_subtype normalized (no case/space variants)": bool(
+            (clean["product_subtype"] == clean["product_subtype"].str.strip().str.upper()).all()
+        ),
         "no names invented (all names appear in source)": set(clean["customer_name"])
         <= set(raw["customer_name"].str.strip()) | {"Unknown"},
         "arr == value for recurring only": round(

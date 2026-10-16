@@ -289,6 +289,83 @@ Extract (incl. mock-API incremental) -> Transform (A/B/C) -> Unify (star-ready) 
 Load (Postgres star schema, idempotent upsert) -> incremental ingest + nightly active
 refresh, both cron-ready. Warehouse: 4,148 contracts / 335 companies, reconciled.
 
+## L2 HYGIENE FIX — product_subtype normalized ✅ (caught by the renewal audit)
+Audit pass-1 exposed dirty `product_subtype`: A's SKU had case drift (ia-core vs
+IA-CORE, 118 rows) and B's plan had trailing spaces ("Standard ", 52 rows). Fixed at
+SOURCE (L2): product_a strips+uppers sku; product_b strips plan. +reconcile checks in
+both. Regenerated clean CSVs + unified_fact (all checks pass). Backfilled already-loaded
+warehouse rows via `scripts/migrations/001_normalize_subtype.sql` (idempotent; 118 A +
+52 B updated) rather than a full reload (which would collide with the incremental batch
+state + load_fact's seed-only reconcile). Warehouse now clean: A {IA-CORE,IA-PRO,IA-ENT},
+B {Standard,Premium,+Pro/Enterprise from the mock batch}. product (A/B/C) + region were
+already clean -> GRR will segment on product x region.
+
+## RENEWAL AUDIT (step 0) — DONE ✅  (`src/etl/metrics/audit_renewals.py`)
+Pass 1 (lay of land): 2,739 recurring (A=1622, B=1117), ~5yr history, 1,667 expired,
+291 multi-contract companies. Caught dirty subtype -> fixed (see L2 hygiene above).
+Pass 2 (reconstruction): chain-match within company×product.
+- Renewal window [−30,+60]d justified by gap distribution (880 at 0d, 488 at 1-7d, valley
+  by 30-60d, p90=29d).
+- CENSORING shown: naive GRR 48.3% vs MATURED 86.5% (maturation lag 60d). The key control.
+- Segment by product×region: all 6 cells 111-475 events; A ~89-91% GRR, B ~80-86% (product
+  = primary driver).
+- Validated 92.5% vs B's is_renewal flag.
+**DECISIONS LOCKED** (window [−30,+60]d, maturation lag 60d, segment product×region) —
+all documented in `docs/methodology.md` (portfolio justification doc, linked from README).
+
+## MODELING APPROACH (locked): closed-form mean + Monte Carlo band
+- Bar height (expected renewals) = closed-form geometric survival (X*p, p^2, ...). MC overkill for the mean.
+- Band (whisker on the stack TOTAL) = Monte Carlo. MC also VALIDATES the closed form (mean must match) — the Black-Scholes×MC pattern (user's GameTheoryModel MC chops reused: path loop, convergence test, CoV stop, bootstrap CIs).
+- KEY: band is driven by PARAMETER/REGIME uncertainty (sample p per path + stress draws), NOT per-contract Bernoulli coin-flips (those average out -> fake-tight band).
+- Keep per-path dynamics SIMPLE (renewal survival), not GameTheory-level.
+
+## Model step 1 — GRR + uncertainty DONE ✅ (`src/etl/metrics/retention.py`)
+Per product×region segment: logo rate + Wilson CI; revenue-weighted GRR + bootstrap 90% CI;
+pooled-to-product fallback if n<N_MIN=30. Reuses audit reconstruct(); matured-only.
+Result: A ~89-91% GRR, B ~80-86%; ALL 86.5% [83.9,88.8]. Band widens as n shrinks
+(B·EU n=111 -> 71.8-87.2 vs A·NA n=475 -> 84.7-92.4). This is what the MC samples.
+
+## Model step 2a — expected-renewal layer (closed-form mean) DONE ✅ (`src/etl/metrics/projection.py`)
+Geometric survival: each active contract renews at segment p, contributing p,p^2,... terms,
+recognized straight-line, 3y horizon. No double-count (only project future expiries; cancelled
+excluded). `rates` is a pluggable {(product,region):p} map (flat now; recency-weighted later —
+backtest picks). Reconciles to the cent. Result: $32.1M expected renewals over 3y on top of
+the $15.8M floor. STACK crossover: near-term ~all guaranteed, by 2029 ~all expected (floor->0).
+Decision noted: trend handling = recency-weighting, documented in methodology.md.
+
+## Model step 2 — projection DONE ✅
+- 2a refactored to a RECOGNITION TENSOR A[seg,gen,week] (recognized $ at p=1) in
+  `projection.py`; closed-form = reduce at point p. Still reconciles ($32.08M).
+- 2b Monte Carlo band (`band.py`): each path draws segment p from bootstrap (retention.
+  _boot_grr), PERSISTS across generations, reduces the tensor: exp_paths = Σ_g (P**g).T @ A.
+  Band = parameter uncertainty only (correlated regime + stress = labelled overlay, later).
+  - VALIDATED: fixed-p MC == closed form exactly. Jensen gap +$18.5k (+0.06%, convex p^g) as
+    predicted. Converged: 2000 paths, CoV 2.5%, P90 half==full.
+  - Whisker WIDENS right: ±$39 now -> ±$12,120 at 3y (~300x). Honest cone.
+MODEL CORE COMPLETE: floor + expected + band, reconciled & cross-validated.
+
+## NEXT: walk-forward BACKTEST (user's home turf — trading backtests)
+Stand at past date, fit rate on train (matured-only, censoring lag INSIDE loop), freeze,
+project unseen window, score vs actuals. Rolling/expanding (pairs-trading engine pattern).
+Forecast metrics: MAE/RMSE/mean-signed-bias + BAND COVERAGE (~80% in P10-P90?) + pinball.
+Referee for flat vs recency-weighted p. Report honestly if it fails.
+Then: stacked-bar viz -> new-revenue layer (3rd layer) -> Flask API -> front end.
+
+## METRICS (L4) — started (teaching mode, go slow)
+Target artifact (user design): weekly STACKED bar — bottom=GUARANTEED (contracted)
+revenue, top=EXPECTED (renewal projection). Build certain floor first, exact; projection
+is Phase 3 (model as a range/scenario band per Shackle/Taleb, not a false-precision line).
+- Revenue measure = recognized revenue, straight-line (ASC 606): arr_usd/365.25 per active
+  DAY. Taught recognized(earned) vs collected(cash) distinction; chose recognized.
+- **Metric 1 — weekly guaranteed runoff DONE ✅** (`src/etl/metrics/runoff.py`):
+  `weekly_runoff(as_of=today)` -> per-week [week_start, active_licenses, guaranteed_usd],
+  recurring only, clipped today-forward, cancel ends recognition, day-level overlap.
+  Result: **$15,769,335 contracted revenue still to recognize**, 155 weeks to 2029-09.
+  Reconciles to the cent (buckets == direct remaining value).
+  - Cross-check: week-0 active_licenses = 1067 = nightly is_active count (independent agree).
+  - 🐛 LESSON: rounded each bucket then summed -> 4c drift. Fix: full precision internally,
+    round only for display, reconcile with np.isclose tolerance.
+
 ## NEXT: serving + quant (the L4 / metrics payoff)
 - Flask API: project CSV/JSON from the warehouse on front-end request (user leans CSV).
 - Metrics/quant layer: licenses outstanding + churn (reads materialized is_active), ARR,

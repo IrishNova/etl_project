@@ -101,6 +101,7 @@ def transform_product_b(raw: pd.DataFrame) -> pd.DataFrame:
     df["end_date"] = _parse_mixed_date(df["end_date"])
     df["cancel_date"] = _parse_mixed_date(df["cancel_date"])
     df["account_name"] = df["account_name"].str.strip()
+    df["plan"] = df["plan"].str.strip()  # source has trailing-space variants ("Standard ")
 
     # --- DERIVE: status / renewal flags ---
     status = _map_strict(df["status"], STATUS_MAP, "status")
@@ -195,6 +196,9 @@ def reconcile(raw: pd.DataFrame, clean: pd.DataFrame) -> None:
         ),
         "no NaT booking_date": clean["booking_date"].notna().all(),
         "no blank/null region": (clean["region"].notna() & (clean["region"] != "")).all(),
+        "product_subtype normalized (no trailing space)": bool(
+            (clean["product_subtype"] == clean["product_subtype"].str.strip()).all()
+        ),
         "is_active == (status active)": bool(
             (clean["is_active"] == (clean["status"] == "active")).all()
         ),

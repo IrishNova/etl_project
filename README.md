@@ -1,6 +1,10 @@
 # ETL Project
 
-An ETL (Extract, Transform, Load) pipeline.
+An ETL (Extract, Transform, Load) pipeline feeding a revenue-planning model.
+
+**Methodology & design decisions:** [`docs/methodology.md`](docs/methodology.md) —
+the analytical choices (recognition basis, GRR, censoring/maturation lag, segmentation,
+backtesting) with the evidence justifying each.
 
 ## Status
 
