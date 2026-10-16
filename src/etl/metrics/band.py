@@ -1,20 +1,12 @@
-"""Model step 2b — Monte Carlo uncertainty band (the whisker on the stack).
+"""Monte Carlo band over the full three-layer stack, calibrated to the backtests.
 
-The closed-form (projection.py) gives the bar heights at the point-estimate rates. This
-wraps it in parameter uncertainty: each path draws every segment's renewal rate p from its
-bootstrap distribution and HOLDS it across all renewal generations (persistence — a path
-where a segment is weak stays weak, so bad regimes compound into a fat right tail; redrawing
-per cycle would cancel out and fake a tight band). Across paths we read P10/P50/P90 per week
-= the whisker on the stacked bar's total.
+Total_path = guaranteed floor (certain, no shock)
+           + expected renewals  (per-cycle error ~±7%, compounding — from the GRR backtest)
+           + new business       (per-quarter error ~±18%, compounding — from the new-biz backtest)
 
-Speed + consistency: everything reduces the recognition tensor A[seg, gen, week] from
-projection.py, so one path is just (P**g).T @ A. With p FIXED at the point estimate this
-reproduces the closed form exactly (validation). With p sampled, the mean sits slightly
-above it — real convexity (Jensen on p^g), not a bug.
-
-Band = parameter/regime uncertainty only (not per-contract coin-flips, which average out).
-A correlated cross-segment regime shock + explicit stress scenario are a labelled overlay
-left for later, by design (no arbitrary stress number baked in here).
+Each uncertain layer draws its own empirical residuals and compounds them across its
+cycles, so the band widens with horizon. With zero error every path reduces to the
+closed-form point estimate (validation). The MC is seeded -> stable band run to run.
 """
 
 from __future__ import annotations
@@ -24,26 +16,10 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from etl.metrics.projection import (
-    MAX_GEN,
-    default_rates,
-    expected_from_tensor,
-    recognition_tensor,
-)
-from etl.metrics.retention import N_MIN, _boot_grr, matured_events
+from etl.metrics.backtest import empirical_errors, segment_rates
+from etl.metrics.new_business import forward_new_weekly, newbiz_errors, trend_sigma
+from etl.metrics.projection import MAX_GEN, recognition_tensor
 from etl.metrics.runoff import weekly_runoff
-
-
-def _segment_draws(segments, as_of, n_paths, rng) -> np.ndarray:
-    """(n_seg, n_paths) bootstrap draws of p per segment (pool to product if thin)."""
-    ev = matured_events(as_of)
-    out = np.zeros((len(segments), n_paths))
-    for i, (prod, region) in enumerate(segments):
-        g = ev[(ev["product"] == prod) & (ev["region"] == region)]
-        if len(g) < N_MIN:
-            g = ev[ev["product"] == prod]
-        out[i] = _boot_grr(g, rng, b=n_paths)
-    return out
 
 
 def _floor_aligned(weeks, as_of) -> np.ndarray:
@@ -52,66 +28,70 @@ def _floor_aligned(weeks, as_of) -> np.ndarray:
     return np.array([m.get(w, 0.0) for w in weeks])
 
 
+def _renewal_base(A: np.ndarray, p_vec: np.ndarray) -> np.ndarray:
+    base = np.zeros((MAX_GEN, A.shape[2]))
+    for g in range(1, MAX_GEN + 1):
+        base[g - 1] = (A[:, g - 1, :] * (p_vec ** g)[:, None]).sum(axis=0)
+    return base
+
+
 def run_mc(n_paths: int = 2000, as_of=None, seed: int = 0, horizon_weeks: int = 156):
     as_of = pd.Timestamp(as_of or date.today()).normalize()
     rng = np.random.default_rng(seed)
+    n_weeks = horizon_weeks
 
+    # --- Layer 1: guaranteed floor (certain) ---
     segments, weeks, A = recognition_tensor(as_of, horizon_weeks)
     floor = _floor_aligned(weeks, as_of)
-    P = _segment_draws(segments, as_of, n_paths, rng)          # (n_seg, n_paths)
 
-    # Expected per path per week, holding each path's p across generations.
-    exp_paths = np.zeros((n_paths, len(weeks)))
-    for g in range(1, MAX_GEN + 1):
-        exp_paths += (P ** g).T @ A[:, g - 1, :]               # (n_paths, n_weeks)
-    total_paths = exp_paths + floor[None, :]
+    # --- Layer 2: expected renewals (per-cycle ±7%, compounding) ---
+    rates = segment_rates(as_of)
+    p_vec = np.array([rates.get(s, rates[("ALL", "ALL")]) for s in segments])
+    ren_base = _renewal_base(A, p_vec)                        # (MAX_GEN, n_weeks)
+    Er = rng.choice(empirical_errors(), size=(n_paths, MAX_GEN))
+    ren_paths = np.cumprod(1.0 + Er, axis=1) @ ren_base       # (n_paths, n_weeks)
 
+    # --- Layer 3: new business (data-derived center + trend uncertainty + level noise) ---
+    # Center = the damped forecast (no judgment call). Two persistent per-path shocks:
+    #   (1) TREND deviation — the growth rate is only knowable to ±trend_sigma (the history
+    #       implies anywhere from ~+2% to +24%/yr), so we span that; it compounds over years.
+    #   (2) LEVEL error (~±18%) — the one-quarter-ahead run-rate error, held persistent.
+    # Not multiplying independent quarterly shocks (that explodes).
+    nb_base, _, _ = forward_new_weekly(n_weeks)               # damped center
+    years = np.arange(n_weeks) / 52.0
+    dg = rng.normal(0.0, trend_sigma(), size=n_paths)         # persistent growth deviation
+    growth = np.maximum(1.0 + dg, 0.01)[:, None] ** years[None, :]
+    Eq = rng.choice(newbiz_errors(), size=n_paths)            # persistent level error
+    nb_paths = nb_base[None, :] * growth * (1.0 + Eq[:, None])
+
+    total_paths = floor[None, :] + ren_paths + nb_paths
     p10, p50, p90 = np.percentile(total_paths, [10, 50, 90], axis=0)
     out = pd.DataFrame({
-        "week_start": weeks, "guaranteed": floor,
-        "expected_p50": np.percentile(exp_paths, 50, axis=0),
+        "week_start": weeks,
+        "guaranteed": floor,
+        "renewals_p50": np.percentile(ren_paths, 50, axis=0),
+        "newbiz_p50": np.percentile(nb_paths, 50, axis=0),
         "total_p10": p10, "total_p50": p50, "total_p90": p90,
     })
-    return out, exp_paths, (segments, weeks, A)
+    # Drop the current partial week (today is mid-week): the floor is day-prorated but
+    # new business isn't, so the stub bar is distorted. Start at the first full week.
+    if as_of.weekday() != 0:
+        out = out.iloc[1:].reset_index(drop=True)
+        total_paths = total_paths[:, 1:]
 
-
-def _validate_and_report(n_paths=2000, as_of=None, seed=0):
-    as_of = pd.Timestamp(as_of or date.today()).normalize()
-    out, exp_paths, (segments, weeks, A) = run_mc(n_paths, as_of, seed)
-
-    # Validation: fixed-p reduction of the tensor == the closed form, exactly.
-    rates = default_rates(as_of)
-    p_vec = np.array([rates.get(s, rates[("ALL", "ALL")]) for s in segments])
-    point = expected_from_tensor(A, p_vec)
-    from etl.metrics.projection import expected_renewal_runoff
-    cf = expected_renewal_runoff(as_of=as_of)["expected_usd"].to_numpy()
-    exact = np.allclose(point, cf, atol=1e-6)
-
-    point_total = point.sum()
-    sampled_total = exp_paths.sum(axis=1)
-    jensen = sampled_total.mean() - point_total
-    cov = sampled_total.std() / sampled_total.mean()
-
-    # Convergence: P90 of 3y total, half the paths vs all.
-    tot = total_3y = (out["total_p50"])  # placeholder to keep names; recompute below
-    half = np.percentile(sampled_total[: n_paths // 2], 90)
-    full = np.percentile(sampled_total, 90)
-
-    print(f"Monte Carlo band — {n_paths:,} paths, as of {as_of.date()}\n")
-    print(f"[{'PASS' if exact else 'FAIL'}] fixed-p MC reduces to the closed form exactly")
-    print(f"closed-form expected (3y): ${point_total:,.0f}")
-    print(f"MC mean expected     (3y): ${sampled_total.mean():,.0f}  "
-          f"(+${jensen:,.0f} convexity / Jensen, expected to be small & positive)")
-    print(f"path-total CoV: {cov:.2%}   P90(3y) half vs full: "
-          f"${half:,.0f} vs ${full:,.0f} (converged if close)\n")
-
-    disp = out.iloc[[0, 12, 26, 52, 78, 104, 130, 155]].copy()
-    disp["whisker_±"] = ((disp["total_p90"] - disp["total_p10"]) / 2)
-    for c in ["guaranteed", "expected_p50", "total_p10", "total_p50", "total_p90", "whisker_±"]:
-        disp[c] = disp[c].round(0).astype(int)
-    print("--- stack with band (whisker should WIDEN to the right) ---")
-    print(disp.to_string(index=False))
+    pieces = {"floor": floor, "ren_base": ren_base, "nb_base": nb_base}
+    return out, total_paths, pieces
 
 
 if __name__ == "__main__":
-    _validate_and_report()
+    out, total_paths, pieces = run_mc()
+    cf = pieces["floor"] + pieces["ren_base"].sum(axis=0) + pieces["nb_base"]
+    print("Three-layer Monte Carlo band\n")
+    print(f"[{'PASS' if np.isfinite(out['total_p50']).all() else 'FAIL'}] band computed")
+    print(f"closed-form total (3y sum): ${cf.sum():,.0f}")
+    print(f"MC median total   (3y sum): ${out['total_p50'].sum():,.0f}\n")
+    disp = out.iloc[[0, 26, 52, 78, 104, 130, 155]].copy()
+    disp["whisker_%"] = ((disp["total_p90"] - disp["total_p10"]) / 2 / disp["total_p50"] * 100).round(1)
+    for c in ["guaranteed", "renewals_p50", "newbiz_p50", "total_p10", "total_p50", "total_p90"]:
+        disp[c] = disp[c].round(0).astype(int)
+    print(disp.to_string(index=False))

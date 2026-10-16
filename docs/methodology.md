@@ -159,6 +159,67 @@ sample), not chosen by eye.
 
 ---
 
+### Net vs gross: NRR drives the projection (GRR is a KPI)
+
+GRR caps each renewal at its prior value — deliberately conservative, no expansion credit.
+But a revenue *forecast* should use the *actual* expected renewed value, so the projection
+uses **Net Revenue Retention (NRR)** (uncapped successor value); GRR stays as a reported KPI.
+
+Measured on the matured cohort: **GRR 86.5% → NRR 92.0%** (+5.5pts of expansion; 13% of
+renewals expand, 7% contract, 80% flat; A 90→94%, B 85→91%). NRR is still **< 100%**, so the
+recurring base still decays — ~8%/yr net vs ~14% gross — it softens the decline, it does not
+reverse it. Using NRR (not GRR) is more accurate, not less honest. Re-backtested under NRR:
+near-unbiased (−1.2%), recency still best, calibrated coverage ~73%; MAE a touch higher
+because expansion adds genuine variance. Production config became **expanding + recency**
+(edged rolling under NRR on bias, MAE and coverage).
+
+## 5b. New-business layer (third, most speculative)
+
+New business = bookings that are **not** renewals (B via its `is_renewal` flag; A
+maintenance via the chain heuristic; one-time A-perpetual + C orders are always new).
+It has **no anchor** (demand generation, not retention of a known base), and we lack
+pipeline/headcount/macro drivers — so this is a **business-as-usual run-rate
+continuation**, not a bottoms-up forecast. It gets the top of the stack, the lightest
+texture, and the widest band.
+
+**Composition** (5y): $55M net-new — **72% one-time** (A perpetual $30.7M + C $9.0M),
+28% new recurring (B $12.5M, A $3.1M). **Growing ~+11%/yr** (unlike A's renewals, which
+decline). On a recognized-revenue axis one-time is recognized at sale, so a steady
+booking run-rate ≈ a steady recognized run-rate (the recognition-timing precision would
+be false given the layer's uncertainty).
+
+**Forecast = damped growth**, chosen by a 12-window walk-forward (new bookings resolve at
+once, so no maturation lag — more power than GRR):
+
+| scheme | bias | MAE | MAPE |
+|---|---|---|---|
+| flat | −$259k (−7%) | $611k | 17.5% |
+| **damped (½ trend)** | **−$83k** | $654k | 19.0% |
+| full trend | +$92k | $700k | 20.6% |
+
+Full trend is the *worst* (over-predicts — the Taleb sin, confirmed). Flat is most
+accurate but **sandbags** a growing business. **Damped** cuts the bias ~3× for a +7% MAE
+cost that is swamped by the layer's ~18% inherent noise — "some growth expectation without
+substantial risk." Flat is kept documented as the ultra-conservative fallback.
+
+**Center = data-derived, never eyeballed.** The growth rate is genuinely unknowable from
+this noisy data (the trend reads anywhere from +2% to +24%/yr depending on the window), so
+we do **not** pick a growth number — the center is just the damped forecast, and the band
+carries the honesty. (A judgment override is only warranted with information the data lacks
+— e.g. a known sales-capacity change — and would be a *labelled scenario line*, never the
+default center.)
+
+**Band = trend uncertainty + level error, both persistent per path.**
+- **Trend deviation** `~N(0, σ)` with **σ ≈ 9.4%/yr** — the *data-derived* spread of the
+  annual-growth estimate across trailing windows (6–20 quarters). It compounds over years,
+  so the cone spans "growth resumes" (P90) to "fades" (P10). This is measured disagreement,
+  not an assumption.
+- **Level error (~±18%)** — the one-quarter-ahead residual, held persistent.
+Independent quarterly shocks are **not** compounded (that exploded the band to ±87%).
+Renewals, by contrast, legitimately compound (renewed revenue feeds the next cycle). A
+multi-step backtest to refine the horizon growth of the level error stays a documented
+refinement.
+
 ## 6. Decisions locked
 
 | Decision | Choice | Justification |
@@ -171,15 +232,23 @@ sample), not chosen by eye.
 | Segmentation | product × region | All 6 cells 111–475 events; product is a real driver |
 | Reconstruction | chain-match within company × product | Validated 92.5% vs B's `is_renewal` flag |
 | Rate over time | recency-weighted, not flat | A's GRR drifts down (93.7→84.7); flat would overstate. Exact weighting set by backtest |
+| Retention rate | NRR for the projection, GRR as KPI | A forecast needs actual expected renewed value (expansion incl.); GRR 86.5%→NRR 92.0% |
+| Production config | expanding train + recency-weighted | Won the walk-forward under NRR on bias, MAE, coverage |
+| New-biz center | data-derived (damped), not a judgment | Growth unknowable from noisy data (+2% to +24%/yr by window); band carries it |
+| New-biz trend band | ±σ≈9.4%/yr, compounding | Data-derived spread of the trend estimate across windows |
+| Uncertainty band | empirical ±7%/cycle, compounded | Backtest showed bootstrap band too tight (18% cov); calibrated to realized errors (LOO ~73%) |
+| New-business layer | include, damped (½ trend) | Completes the picture; damped beat flat on bias, trend on error — growth without the risky full extrapolation |
+| New-business band | persistent ±18% level error | 1-qtr backtest residual; not compounded (that explodes). Multi-step backtest = refinement |
 
 ---
 
-## 7. Projection & uncertainty display (planned)
+## 7. Projection & uncertainty display
 
 - **Point estimate = the bars.** Uncertainty = a **single whisker (P10–P90) on each week's
   total**, not a range per segment. One honest range per bar.
-- The whisker **widens with horizon** (projecting multiple renewal cycles compounds
-  uncertainty — `p^n` with error bars). A flat band would be a lie.
+- The whisker **widens with horizon** because the per-cycle error (±7%, from the backtest)
+  **compounds** across renewal generations — ±0.1% near-term to ±12% at 3 years. A flat
+  band would be a lie.
 - **Fill encodes certainty:** guaranteed = solid, projected = lighter/hatched, so "known vs
   assumed" reads instantly.
 - **Scenarios:** base / downside / upside, where downside includes a **stress case** (fat
@@ -187,26 +256,68 @@ sample), not chosen by eye.
 
 ---
 
-## 8. Backtesting (planned)
+## 8. Backtesting — results
 
 Walk-forward validation (modelled on the author's `pairs-trading` engine): **fit the rate
-on a training window, freeze it, project the unseen window, score against actuals**;
-rolling or expanding. A **maturation lag lives inside the loop** — a test window's actuals
-are only scored once resolved. Metrics are forecast-quality, not returns:
+on matured events before T, freeze it, predict the cohort expiring in `[T, T+quarter]`,
+score against the realized outcome**; rolling vs expanding × flat vs recency. The
+**maturation lag lives inside the loop** — a window is only scored once `T + h + lag ≤
+today`. Scope is honest: we validate the **one-cycle (gen-1)** renewal, the part data can
+check; the multi-year compounding is mechanical given gen-1 and has no future to test
+against. 11 fully-matured quarterly windows — limited power, stated plainly.
 
-- **Error/bias:** MAE, RMSE, mean signed error.
-- **Band coverage:** did ~80% of actuals land inside the P10–P90 band? (Validates the
-  *uncertainty*, not just the point.)
-- **Pinball / interval score:** the proper scoring rule for a quantile forecast.
+**Finding 1 — the point forecast is sound.** Near-unbiased (bias −0.3% to −0.5%), MAE
+~$81k on ~$1.3M cohorts (**≈6%**). `X·p` works one cycle. **Recency beats flat** on every
+metric → the recency decision is earned, not asserted. Chosen config: **expanding +
+recency-weighted** (rolling under GRR; expanding edged it once the rate switched to NRR).
 
-If the model does not validate, we report that plainly rather than torture the data.
+**Finding 2 — the bootstrap band was overconfident, and the backtest caught it.** Coverage
+was only **18–36%** vs a nominal 80%: the bootstrap carried rate-sampling noise but not the
+**drift + cohort idiosyncrasy** that actually move quarter to quarter.
+
+**Fix — calibrate to realized error.** The realized relative errors `(actual−pred)/pred`
+ARE the true out-of-sample dispersion: **≈ ±7% per quarter-cycle**. Leave-one-out coverage
+then rises to **~73%**. We do **not** chase exactly 80%: at n=11, "8 of 11 covered" (72.7%)
+is statistically indistinguishable from 80% (expected ~8.8, σ≈1.3), so forcing 80% would
+overfit the metric. Honest statement: *calibrated to ≈±7%/quarter; limited power.*
+
+**Forward band.** That ±7%/cycle dispersion feeds the Monte Carlo band (`band.py`): each
+path draws one error per renewal cycle from the empirical residual pool and **compounds**
+them, so the whisker widens with horizon off a backtested foundation — ±0.1% near-term
+(contracted floor) to **±12% at 3 years**. With zero error a path reduces to the closed
+form exactly (validation).
+
+Verdict: the point model validates; the uncertainty is now empirical, not theoretical; and
+where power is thin we say so rather than torture the data.
 
 ---
 
 ## 9. Open risks
 
-- **Stationarity:** the 86.5% GRR is pooled over 2021–2026. If retention is trending, a
-  static rate hides it — the walk-forward backtest is designed to expose this.
+- **Stationarity:** A's GRR is trending down. Addressed via recency-weighting + a rolling
+  train window (both validated by the backtest); residual drift is absorbed into the
+  empirical ±7%/cycle band rather than assumed away.
+- **Statistical power:** only 11 fully-matured backtest windows, so coverage (~73%) can't
+  be distinguished from 80%. More history (or shorter cohorts) would sharpen calibration.
+- **New-business horizon:** the ±18% band is held persistent (1-quarter error); a
+  multi-step backtest to measure how the error grows with horizon is a known refinement.
+- **New-business dominance:** the layer is large and steady, which could make the total
+  look healthy and mask the contracted-floor cliff — mitigated by texture-ranking the
+  layers (solid→hatch→dots) so "guaranteed vs speculative" reads at a glance.
+
+## 10. Operations — keeping projections live (planned)
+
+- **Scheduled recompute.** Projections are materialized on a schedule, not computed per
+  dashboard hit: a nightly/weekly cron re-runs the metrics chain and regenerates
+  `projection_series.json` (+ chart), and the Flask API serves the latest file. Same
+  pattern as the nightly `is_active` materialization. The chain runs in seconds and the
+  MC is **seeded**, so the band is stable run-to-run (no flicker). Cadence is a config knob.
+- **Self-adjustment.** The rate (recency-weighted, rolling) and the new-business run-rate
+  (damped on a trailing window) are **refit each run**, so if renewals or new business
+  deteriorate, the projections follow down automatically — no manual intervention.
+- **Circuit-breaker.** An explicit tripwire for regime breaks: when live actuals fall
+  outside the band for N periods, flag it and fall back to the conservative (flat) scheme.
+  This alarm doubles as the signal for "is growth falling off" monitoring charts.
 - **Concurrency in matching:** companies with multiple concurrent same-product contracts
   could create spurious matches; mitigated by within-product matching and corroborated by
   the 92.5% flag agreement.

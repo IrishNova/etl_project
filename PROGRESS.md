@@ -344,12 +344,73 @@ Decision noted: trend handling = recency-weighting, documented in methodology.md
   - Whisker WIDENS right: ±$39 now -> ±$12,120 at 3y (~300x). Honest cone.
 MODEL CORE COMPLETE: floor + expected + band, reconciled & cross-validated.
 
-## NEXT: walk-forward BACKTEST (user's home turf — trading backtests)
-Stand at past date, fit rate on train (matured-only, censoring lag INSIDE loop), freeze,
-project unseen window, score vs actuals. Rolling/expanding (pairs-trading engine pattern).
-Forecast metrics: MAE/RMSE/mean-signed-bias + BAND COVERAGE (~80% in P10-P90?) + pinball.
-Referee for flat vs recency-weighted p. Report honestly if it fails.
-Then: stacked-bar viz -> new-revenue layer (3rd layer) -> Flask API -> front end.
+## Model step 3 — walk-forward BACKTEST + band recalibration DONE ✅ (`backtest.py`)
+Scope: validate ONE-CYCLE (gen-1) renewal only (compounding has no future to test). Quarterly
+cohorts, matured-only, censoring lag inside loop. 11 windows (limited power, stated).
+- FINDING 1: point forecast sound — bias -0.3/-0.5%, MAE ~$81k (~6%). Recency > flat on all
+  metrics. PRODUCTION CONFIG = rolling + recency.
+- FINDING 2: bootstrap band WAY too tight — coverage 18-36% vs 80%. Backtest caught our
+  overconfidence (missing drift + cohort idiosyncrasy).
+- FIX: calibrate band to realized errors (actual-pred)/pred = ±~7%/quarter-cycle. LOO coverage
+  ~73%; NOT chasing 80% (8/11 indistinguishable from 80% at n=11 — would overfit metric).
+- WIRED into forward band (`band.py` rewritten): each path draws per-cycle error from the
+  empirical residual pool, COMPOUNDS (F_g=prod(1+e)); gen-g revenue scaled by F_g. Uses
+  rolling+recency production rates (`backtest.segment_rates`). Zero-error path == closed form
+  (validation PASS). Whisker: ±0.1% now -> ±12% at 3y (~2.7x the old bootstrap). Honest cone.
+- ALL documented in docs/methodology.md (section 8 results + decisions-table rows + risks).
+
+## Stacked-bar CHART DONE ✅ (`src/etl/metrics/chart.py`)
+matplotlib (added matplotlib==3.9.2). Weekly stacked bars: guaranteed (solid blue) +
+expected renewals (hatched orange = projected) + grey P10-P90 band widening right.
+Dataviz skill followed: validated palette (slots 1/2, CVD ΔE 24.7), fill=certainty
+encoding, recessive grid, legend, eyeballed (fixed title/subtitle collision + legend order).
+Writes `reports/projection.png` + `data/processed/projection_series.json` (weekly:
+guaranteed/expected/p10/p50/p90) — the JSON is what Flask will serve.
+Story: floor melts, renewals fill, band fans out; crossover ~Sep 2027.
+
+## New-business layer (3rd) + 3-layer chart DONE ✅
+- `audit_newbiz.py`: new = not-a-renewal (B via is_renewal, A via chain, one-time always new).
+  $55M/5y, 72% one-time (A perp+C), 28% new recurring. Growing ~+11%/yr.
+- `new_business.py`: quarterly forecast flat/damped/trend + 12-window walk-forward (no
+  maturation lag). DAMPED chosen (bias -83k vs flat -259k; trend worst/over-predicts).
+  forward_quarterly/forward_new_weekly (recognized≈booked run-rate) + newbiz_errors.
+- `band.py` v3: 3-layer MC — floor(certain) + renewals(±7%/cycle compounding) + new-biz
+  (±18% PERSISTENT level error, NOT compounded — compounding exploded to ±87%, fixed).
+  Band now 11-17% growing as floor melts. Seeded (stable).
+- `chart.py`: 3 stacked layers (blue solid / orange hatch / aqua dots = certainty ranking),
+  validated 3-colour palette, grey P10-P90. reports/projection.png + projection_series.json.
+  Story: floor melts, renewals fill, new-biz steady on top (~$300k/wk), total ~$650k->$585k/wk.
+- Docs: methodology §5b (new-biz) + §10 (ops: scheduled refresh + self-adjust + circuit-breaker)
+  + decisions rows + risks. All traceable.
+- DECISIONS (user): damped OK given guardrails; circuit-breaker + scheduled refresh = planned ops.
+
+## REFINEMENT (user Qd the downtrend): expansion + trend-uncertainty ✅
+- B — EXPANSION/NRR: added succ_arr to reconstruct; `retention.nrr_audit()`. GRR 86.5% ->
+  NRR 92.0% (+5.5% expansion; 13% expand/7% contract/80% flat; A 94%, B 91%). Still <100%
+  so base decays ~8%/yr (not 14%) — softens, doesn't reverse. SWITCHED projection to NRR
+  (succ_arr via backtest.RETAIN_COL); GRR kept as KPI. Re-backtested: bias -1.2%, recency
+  best, cov ~73%; production config -> EXPANDING+recency (edged rolling under NRR).
+- A — NEW-BIZ TREND UNCERTAINTY: center stays data-derived damped (NO judgment call — growth
+  unknowable, +2..+24%/yr by window). `new_business.trend_sigma()` = 9.4%/yr (spread across
+  windows). band.py: per-path persistent growth deviation N(0,σ) compounding over years +
+  ±18% level error. Whisker now 13% -> 27% at 3y, asymmetric upside.
+- RESULT: central flatter (~$663k->$632k/wk vs old $650->586), band honestly spans
+  $502k-$845k at 3y. No longer a confident decline. Re-charted + re-emitted JSON.
+- Docs: methodology §5 (NRR), §5b (trend band), decisions rows, §8 config. PROGRESS here.
+- TEACHING MOMENT: user pushed back on arbitrary "pick a growth %"; corrected to "center =
+  data-derived, band carries uncertainty; override only with info data lacks (labelled scenario)".
+
+## FIXES (user eyeballed the chart):
+- Partial-week t0 bar was distorted (floor day-prorated, new-biz not) -> drop the current
+  partial week; chart/JSON start at first FULL week. (band.run_mc)
+- Near-term cone width (±10.6%) explained + verified: floor 54% CERTAIN, new business 45%
+  UNSOLD (±18% measured) -> near-term uncertainty is entirely the unsold new-biz slice;
+  cone grows ±10.6% -> ±27% (right shape). Data gap noted: no pipeline/bookings-forward data
+  to tighten near-term new business.
+
+## NEXT: FLASK API — serve projection_series.json (materialized; the ops refresh loop regenerates it).
+Then front end. BACKLOG ops: nightly/weekly projection-refresh cron (3rd loop) + circuit-breaker
++ "growth falling off" monitor charts. Plus the mock-API data generator (earlier backlog).
 
 ## METRICS (L4) — started (teaching mode, go slow)
 Target artifact (user design): weekly STACKED bar — bottom=GUARANTEED (contracted)

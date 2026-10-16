@@ -124,6 +124,7 @@ def reconstruct(df: pd.DataFrame, win_before: int = 30, win_after: int = 60,
                 "nearest_gap_days": best_gap,
                 "renewed": bool(renewed),
                 "retained_arr": float(min(arrs[best_j], arrs[pi])) if renewed else 0.0,
+                "succ_arr": float(arrs[best_j]) if renewed else 0.0,  # uncapped -> NRR/expansion
                 "succ_is_renewal": (bool(isren[best_j]) if renewed and isren[best_j] is not None
                                     and not pd.isna(isren[best_j]) else None),
             })

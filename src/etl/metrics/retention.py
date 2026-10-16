@@ -60,6 +60,36 @@ def _wilson(k: int, n: int, z: float = 1.645) -> tuple[float, float]:
     return (max(0.0, c - h), min(1.0, c + h))
 
 
+def nrr_audit(as_of=None) -> None:
+    """Measure NET revenue retention vs GROSS — i.e. is there expansion/upsell we ignore?
+
+    GRR caps each renewal at its own prior value (no expansion credit). NRR counts the
+    full successor value, so NRR > GRR means existing customers are growing their spend.
+    NRR is the honest retention of the recurring base; if it is near/above 100%, the base
+    does not decay the way the gross model assumes.
+    """
+    ev = matured_events(as_of)
+    pred = ev["pred_arr"].sum()
+    grr = ev["retained_arr"].sum() / pred
+    nrr = ev["succ_arr"].sum() / pred
+    ren = ev[ev["renewed"]].copy()
+    ratio = ren["succ_arr"] / ren["pred_arr"]
+    exp = (ratio > 1.001).mean()
+    con = (ratio < 0.999).mean()
+
+    print("=== NET vs GROSS retention (matured renewal cohort) ===")
+    print(f"GRR (gross, capped): {grr:.1%}")
+    print(f"NRR (net,  uncapped): {nrr:.1%}   -> expansion lift = {nrr - grr:+.1%}")
+    print(f"\namong RENEWED contracts: expanded {exp:.0%} | contracted {con:.0%} | "
+          f"flat {1 - exp - con:.0%}")
+    print(f"median renewal value change: {ratio.median() - 1:+.1%}\n")
+
+    print("by product:")
+    for prod, g in ev.groupby("product"):
+        p = g["pred_arr"].sum()
+        print(f"  {prod}: GRR {g['retained_arr'].sum()/p:.1%}   NRR {g['succ_arr'].sum()/p:.1%}")
+
+
 def estimate(as_of=None, n_min: int = N_MIN, seed: int = 0) -> pd.DataFrame:
     ev = matured_events(as_of)
     rng = np.random.default_rng(seed)
