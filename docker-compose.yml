@@ -1,0 +1,29 @@
+# Local dev stack. Step 1: just the database.
+# The `api` and `pipeline` services (sharing one Dockerfile) get added here later
+# — this file is written to grow into them without restructuring.
+#
+# Bring up:   docker compose up -d db
+# Logs:       docker compose logs -f db
+# Tear down:  docker compose down            (add -v to also wipe the data volume)
+services:
+  db:
+    image: postgres:16
+    container_name: etl_warehouse_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      # Host 5433 -> container 5432, dodging the system Postgres already on 5432.
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

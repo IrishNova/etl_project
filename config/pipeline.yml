@@ -1,0 +1,19 @@
+# Operational pipeline config (NON-secret — secrets live in .env).
+# Read by the ingest entrypoints and the cron scripts. Paths are relative to the
+# project root unless absolute.
+
+ingest:
+  # Fast loop: how often the cron pulls new data from the (mock) product APIs.
+  interval_minutes: 15
+  # Landing zone where a poll of the APIs drops its response batch files.
+  landing_zone: data/raw/incoming
+  # Where processed batches are moved after a successful load (the watermark:
+  # a file still in the landing zone = not yet ingested).
+  archive_zone: data/raw/processed_batches
+
+active_refresh:
+  # Slow loop: is_active / status are recomputed on this cadence (nightly),
+  # because a contract can only flip active<->expired at a day boundary.
+  schedule: nightly
+  # The as-of date the nightly job evaluates against. "today" = system date.
+  as_of: today

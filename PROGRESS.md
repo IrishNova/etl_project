@@ -201,6 +201,119 @@ one row per contract. All 8 reconciliation checks pass; $83,035,467 reconciles e
   so "" came back as string not NaN -> 11 C-only looked "matched". Fix: replace ""->NA
   after merge for company_id/company_name.
 
-## Next: L4 VIEWS (the payoff — cut views off the fact table)
-- licenses-outstanding + churn (uses active_as_of at a chosen snapshot).
-- then dashboard (Flask vs Tableau — TBD) and Phase 3 projections.
+## ARCHITECTURE DECISION (post-L3): go "live", full build
+Goal: a portfolio gem — real end-to-end system, not just a notebook. Pieces:
+  pipeline (incremental ingest) -> **Postgres** (source of truth) -> metrics/quant
+  layer -> Flask API -> front end (Tableau Public OR custom JS — decided later).
+- **Store = PostgreSQL** (user chose: strongest "ingest from ERP/CRM" signal).
+- **Deployment = fully dockerized, built incrementally.** 3 roles: db (long-run),
+  api (long-run, Flask), pipeline (batch job). One Dockerfile shared by api+pipeline,
+  one docker-compose orchestrating all 3. 12-FACTOR from day one: all config via env
+  vars so identical code runs on host (dev) and in-container (deploy).
+- Tableau reality check: Tableau connects to DB/extracts, NOT a live REST API. So
+  front end is either Tableau Public (on a published extract) or a JS dash hitting
+  Flask. Decide once metrics exist.
+- QUANT side flagged by user as SUPER important.
+
+## LOAD (L) phase — the real "L" we'd skipped (src/etl/load/ was empty)
+Plan: (1) stand up Postgres ✅  (2) connection layer  (3) schema/DDL  (4) load+upsert
+(idempotent INSERT..ON CONFLICT = the "add new data" mechanism)  (5) prove incremental
+ingest with a 2nd mock batch.
+
+### Steps 2-4 — connection, star schema, load+upsert ✅
+- **Step 2 — connection layer** (`src/etl/load/db.py`): `get_engine()` builds a pooled
+  SQLAlchemy engine from `DATABASE_URL` (loaded via python-dotenv; no-op in Docker).
+  `pool_pre_ping=True`. `ping()` + __main__ smoke test (password masked). Works.
+- **Step 3 — star schema** (`src/etl/load/tables.py`, SQLAlchemy Core so schema lives
+  in Python, not a drifting .sql): `dim_company` (PK company_id), `fact_contracts`
+  (PK (product,contract_id), FK company_id->dim), `map_customer` (PK (source,src_id),
+  FK company_id, the match-audit/review table). dates=date, money=numeric(18,6),
+  flags=boolean, loaded_at=timestamptz. Indexes on company_id/booking_date/revenue_type.
+  `create_schema(engine, drop=)`. Verified in psql.
+- **Step 4 — load + upsert** (`src/etl/load/load_fact.py`): reads clean CSVs, builds
+  dim_company (groupby crosswalk; needs_review=any-member-flagged, n_legal_entities),
+  loads dim FIRST (FK parent) then fact + map. Upsert = `pg_insert(...).on_conflict_
+  do_update` on the PK → idempotent. Row coercion is TYPE-DRIVEN off the Table columns
+  (dates/int/numeric/bool, ""->NULL, numpy->native). Loaded **334 companies / 4,146
+  contracts / 717 mappings**; reconciles vs source ($83,035,467), 0 orphan FKs.
+  **Idempotency proven: ran twice, counts unchanged.**
+  - 🐛 pandas reads "True"/"False" text as real bool dtype even with keep_default_na=
+    False, so mapping string keys gave all-NaN. Fix: leave needs_review as bool.
+
+### Step 5 — incremental ingest (Pattern B, landing zone = mock API) ✅
+Operational design (user): fast loop pulls from "APIs" every n min (config) and upserts;
+nightly loop materializes is_active/status (only flips at day boundaries). Flask API
+later projects CSV/JSON on front-end request.
+- **is_active design LOCKED**: `active_as_of()` stays the single rule; the NIGHTLY job
+  calls it with as_of=today and WRITES is_active/status into fact_contracts. (Refines
+  the earlier "never store" — we store a nightly-materialized snapshot of the function.)
+- `config/pipeline.yml` + `src/etl/config.py` (load_config, resolve_path). Settings:
+  ingest.interval_minutes=15, landing_zone, archive_zone, active_refresh.as_of=today.
+  Chose YAML (PyYAML 6.0.2 added).
+- `src/etl/extract/mock_api.py`: `iter_incoming_batches()` reads batch files from the
+  landing zone (stand-in for an API poll); `archive_batch()` moves them out = watermark.
+- `src/etl/ingest_incremental.py` (FAST LOOP entrypoint): fetch batch -> transform_
+  product_b (reused) -> resolve company (norm+region; new->dim insert-only so existing
+  company attrs aren't clobbered) -> upsert dim/fact/map -> archive. `upsert(update=)`
+  gained DO NOTHING mode.
+- **DEMONSTRATED** with `product_b_batch_20261015_0900.csv` (3 recs): facts 4146->4148
+  (2 new, 1 update-in-place), companies 334->335 (novatech new; cascade reused), total
+  $83,035,467->$83,222,002.85 (+USD50k +EUR120k->USD136,535.85 via batch-date FX).
+  SUB001026 active->cancelled in place (no dupe). Re-run = "no batches" (watermark holds).
+- Wrinkles noted for later: B renewal inference vs warehouse history (API supplies
+  is_renewal for now); incremental path does exact company match else create (no fuzzy/
+  needs_review yet).
+
+### Step 5 chunk 3 — nightly is_active/status refresh ✅ (`src/etl/refresh_active.py`)
+SLOW LOOP entrypoint. Reads every contract's window from fact_contracts, runs
+`active_as_of(as_of)` (as_of from config, default today), writes is_active+status back
+via a bulk UPDATE (bindparam executemany). active_as_of stays the single rule; this
+materializes it on the cadence it changes.
+- Ran as of 2026-10-15: all 4,148 rows now have a status (no more NULLs). recurring ->
+  active 1067 / expired 1645 / cancelled 27; non-recurring -> n/a 1409. The 17 B subs
+  ending Oct 1-15 flipped active->expired (point of nightly). Idempotent (recompute+overwrite).
+- NOTE: stored `status` now means "as of last nightly refresh", not the source's
+  09-30 snapshot. active_as_of is pure, so validate_against_b(09-30) still passes.
+
+### Step 5 chunk 2+3 — cron wrappers ✅  (LOAD PHASE COMPLETE)
+- `scripts/ingest.sh` (fast) + `scripts/refresh_active.sh` (nightly): self-locating
+  (resolve repo root from script path, activate venv, set PYTHONPATH), timestamped logs,
+  `set -euo pipefail`. Executable. Both smoke-tested OK.
+- `scripts/crontab.example`: template with <SCHEDULE>/<REPO_PATH> placeholders — NOT
+  installed (user wants it enabled on deployment, not now). README "Scheduled jobs —
+  ENABLE ON DEPLOYMENT" section documents how to flip it on.
+- Decision: do NOT touch the real crontab; just hand over ready scripts + template.
+
+## ===== FULL E-T-L PIPELINE COMPLETE =====
+Extract (incl. mock-API incremental) -> Transform (A/B/C) -> Unify (star-ready) ->
+Load (Postgres star schema, idempotent upsert) -> incremental ingest + nightly active
+refresh, both cron-ready. Warehouse: 4,148 contracts / 335 companies, reconciled.
+
+## NEXT: serving + quant (the L4 / metrics payoff)
+- Flask API: project CSV/JSON from the warehouse on front-end request (user leans CSV).
+- Metrics/quant layer: licenses outstanding + churn (reads materialized is_active), ARR,
+  cohorts, retention/NRR, then Phase 3 projections.
+- Front end: Tableau Public (on a published extract) OR custom JS hitting Flask — decide
+  once metrics exist. Dockerize api+pipeline into the compose later.
+- README full refresh when packaging for portfolio (status still says "scaffolding").
+
+## BACKLOG (parked, build later)
+- **Mock-API data GENERATOR (option 1, user-approved)**: the demo batch was a single
+  hand-made static file (now archived) — there is NO live data source yet. Build a
+  generator that synthesizes a small realistic mix of new records each poll (mostly new
+  sales, some renewals, occasional cancellations), dated ~now, so the dashboard actually
+  moves. Dependency: FX cache ends 2026-10-02 — live "today"-dated FX rows need the cache
+  refreshed (or ffill latest rate). This is what makes the n-minute loop meaningful.
+
+### Step 1 — Postgres up ✅
+- `docker-compose.yml`: `db` service (postgres:16, named vol `pgdata`, healthcheck,
+  restart). Written to grow into api/pipeline services later.
+- Host **5433** -> container 5432 (system Postgres already owns host 5432).
+- `.env` (git-ignored, confirmed) + `.env.example`: POSTGRES_* + `DATABASE_URL`
+  (`postgresql+psycopg2://etl:...@localhost:5433/etl_warehouse`).
+- requirements += SQLAlchemy 2.0.36, psycopg2-binary 2.9.10, python-dotenv 1.0.1.
+- Verified: psql connects, PG 16.10, db `etl_warehouse` live. Commands in compose header.
+
+## Also pending: L4 VIEWS / metrics (the quant payoff)
+- licenses-outstanding + churn (uses active_as_of at a chosen snapshot), ARR, cohorts,
+  retention/NRR, then Phase 3 projections. Sits on top of Postgres.

@@ -1,0 +1,13 @@
+# ============================================================================
+# ETL pipeline schedule — ENABLE ON DEPLOYMENT.
+# Not installed automatically. To turn it on: fill in the <SCHEDULE> and the
+# absolute <REPO_PATH>, then add these lines with `crontab -e`.
+#
+# Keep the fast-loop cadence in sync with config/pipeline.yml -> ingest.interval_minutes.
+# ============================================================================
+
+# --- FAST LOOP: pull new data from the APIs and upsert (default: every 15 min) ---
+# */15 * * * *  <REPO_PATH>/scripts/ingest.sh          >> <REPO_PATH>/logs/ingest.log 2>&1
+
+# --- NIGHTLY LOOP: recompute is_active / status as-of today (default: 02:00) ---
+# 0 2 * * *     <REPO_PATH>/scripts/refresh_active.sh  >> <REPO_PATH>/logs/refresh_active.log 2>&1
