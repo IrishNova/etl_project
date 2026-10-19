@@ -103,6 +103,59 @@ Index("ix_fact_booking_date", fact_contracts.c.booking_date)
 Index("ix_fact_revenue_type", fact_contracts.c.revenue_type)
 
 
+fact_opportunity = Table(
+    "fact_opportunity",
+    metadata,
+    Column("opportunity_id", Text, primary_key=True),
+    Column("crm_source", Text),
+    # Soft link to dim_company: pipeline includes PROSPECTS not yet in the customer
+    # dimension, so this is indexed for joins but NOT a hard FK (would reject prospects).
+    Column("company_id", Text),
+    Column("account_id", Text),
+    Column("account_name", Text),
+    Column("region", Text),
+    Column("product", Text),
+    Column("product_subtype", Text),
+    Column("opp_type", Text),
+    Column("stage", Text),
+    Column("stage_rank", Integer),
+    Column("status", Text),
+    Column("amount_orig", MONEY),
+    Column("currency", Text),
+    Column("amount_usd", MONEY),
+    Column("crm_probability", Numeric(5, 4)),   # STATED prob in [0,1]; calibrated later
+    Column("forecast_category", Text),
+    Column("created_date", Date),
+    Column("close_date", Date),
+    Column("seats", Integer),
+    Column("term_months", Integer),
+    Column("owner", Text),
+    Column("lead_source", Text),
+    Column("loss_reason", Text),
+    Column("erp_ref", Text),                     # link to fact_contracts (won deals)
+    Column("source_file", Text),
+    Column("loaded_at", DateTime(timezone=True)),
+)
+
+pipeline_stage_history = Table(
+    "pipeline_stage_history",
+    metadata,
+    Column("opportunity_id", Text, nullable=False),
+    Column("from_stage", Text),
+    Column("to_stage", Text, nullable=False),
+    Column("changed_on", DateTime),
+    Column("changed_by", Text),
+    PrimaryKeyConstraint("opportunity_id", "changed_on", "to_stage", name="pk_stage_history"),
+)
+
+Index("ix_opp_company", fact_opportunity.c.company_id)
+Index("ix_opp_status", fact_opportunity.c.status)
+Index("ix_opp_close_date", fact_opportunity.c.close_date)
+Index("ix_opp_created_date", fact_opportunity.c.created_date)
+Index("ix_stagehist_opp", pipeline_stage_history.c.opportunity_id)
+Index("ix_stagehist_changed", pipeline_stage_history.c.changed_on)
+
+
 def create_schema(engine: Engine, drop: bool = False) -> None:
     """Create all tables (optionally dropping them first for a clean rebuild)."""
     if drop:

@@ -23,6 +23,10 @@ data/processed/*
 logs/*
 !logs/.gitkeep
 
+# Hold-out truth — answer keys + data generators. Never committed, never read
+# during the build; used only for a final honest validation.
+_answer_key/
+
 # OS / editor
 .DS_Store
 .idea/

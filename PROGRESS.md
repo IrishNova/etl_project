@@ -408,7 +408,53 @@ Story: floor melts, renewals fill, band fans out; crossover ~Sep 2027.
   cone grows ±10.6% -> ±27% (right shape). Data gap noted: no pipeline/bookings-forward data
   to tighten near-term new business.
 
-## NEXT: FLASK API — serve projection_series.json (materialized; the ops refresh loop regenerates it).
+## PIPELINE DATA (weekend drop) — mini-ETL DONE ✅
+New data in _data: pipeline_opportunities.csv (8143, 2 CRMs) + pipeline_stage_history.csv (30k
+events). Support data parked. Answer keys + generators QUARANTINED in _answer_key/ (gitignored,
+not read until final scoring). Deep-research methodology brief at reports/Sales pipeline
+forecasting methods.md (calibrate CRM prob via isotonic; MC over win×timing×amount + bootstrap;
+lead-time reliable-horizon blend; point-in-time backtest).
+- Extract: `src/etl/extract/pipeline.py` (load_opportunities, load_stage_history; raw text).
+- Transform: `src/etl/transform/pipeline.py` — conform 2 CRMs: product 12->A/B/C, opp_type 9->
+  new/renewal/expansion, stage (typos/case, 2 vocabs)->{Qualify,Proposal,Negotiate,Contract,Won,
+  Lost}+rank1-4, amount strip $/commas+FX, prob 25/25%/0.25->[0,1], mixed dates, drop 40 dup ids.
+  raise-on-unmapped. 8103 clean (2585 won/4917 lost/601 open). VERIFIED: mappings correct (cross-
+  tab), 0 silent parse losses, 100% of 1708 won erp_refs link to real fact_contracts.
+- Load: `fact_opportunity` + `pipeline_stage_history` tables (load/tables.py); `load_pipeline.py`
+  upsert (idempotent). company_id = SOFT link (prospects not in dim_company -> no hard FK).
+- NOTE: 877 won opps have NO erp_ref -> handle opp<->contract linkage as a VALIDATED reconciliation
+  step (not transform; same principle as C-name enrichment). 1708 known links = ground-truth anchor.
+
+## PIPELINE FORECAST MODEL — built (calibration -> timing -> MC) ✅
+- opp<->contract reconciliation: matcher (product+amount~10%+date~7d, company tiebreak) VALIDATED
+  92.8% on 1708 known; ~48% unambiguous. NOT needed for forecast (only blend-time double-count),
+  so parked. 1708 known links = ground truth.
+- Step 1 CALIBRATION (`pipeline_calibration.py`): empirical stage win-rate from stage_history
+  (reached-stage, resolved only, open censored): Qualify 35% / Proposal 47% / Negotiate 70% /
+  Contract 72% vs CRM 25/50/75/75 -> CRM UNDER-states early deals. Data-derived, answer key untouched.
+- Step 2 TIMING (`pipeline_timing.py`, lifelines KM per product): median close 39/41/24d A/B/C;
+  open deals right-censored; conditional sampling S(t)/S(age) (old deals pushed later).
+- Step 3 MC (`pipeline_forecast.py`): per trial Beta(won+1,lost+1) p per stage (= param uncertainty
+  + cross-deal correlation) x Bernoulli win x survival close-month x opp amount -> monthly dist.
+  Result: 577 open deals -> P50 $5.0M/6mo [$4.0-6.2M]; converts Oct-Nov then RUNS DRY by ~month 3
+  (= empirical reliable horizon -> hand off to run-rate). lifelines==0.29.0 added.
+
+## Step 4 BACKTEST — point-in-time walk-forward DONE ✅ (`pipeline_backtest.py`)
+Reconstruct pipeline as-of T from stage_history (stage = last to_stage <= T); refit calibration
++ timing on resolved-BEFORE-T only (no leakage); forecast [T,T+2mo]; vs actual won-in-window.
+24 monthly origins. RESULTS: WAPE 13.5%, coverage 79% (target 80 -> band well-calibrated out of
+the box, no recalibration needed), mean bias +9.6% (slight over-forecast), pinball $72k.
+Known limit: only current amount (no historical amount snapshots) -> amount not point-in-time
+(affects both sides equally; flagged).
+BIAS RESOLVED: empirical debias (user chose). factor = sum(actual)/sum(p50) = 0.912, validated
+LEAVE-ONE-OUT (honest): debiased WAPE 11.7% (from 13.5), bias +0.0% (from +9.6), coverage 79% held.
+Wired into live forecast (pipeline_forecast applies debias_factor()). Live: P50 $4.57M/6mo
+[$3.62-5.68M]. `debias_factor()` in pipeline_backtest (lru_cached).
+PIPELINE MODEL COMPLETE: calibration -> timing -> MC -> backtest -> debias. Pure statistical.
+
+## NEXT: (5) BLEND near-term pipeline (converts ~2mo, runs dry ~mo3) + far-term run-rate at the
+## reliable horizon -> swap into the new-business layer (pure statistical, replaces hand-tuned).
+## Still pending: Flask API serve projection_series.json.
 Then front end. BACKLOG ops: nightly/weekly projection-refresh cron (3rd loop) + circuit-breaker
 + "growth falling off" monitor charts. Plus the mock-API data generator (earlier backlog).
 
