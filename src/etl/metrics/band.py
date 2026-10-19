@@ -15,9 +15,11 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
+from scipy.ndimage import uniform_filter1d
 
 from etl.metrics.backtest import empirical_errors, segment_rates
 from etl.metrics.new_business import forward_new_weekly, newbiz_errors, trend_sigma
+from etl.metrics.pipeline_forecast import leadtime_weight, weekly_booking_samples
 from etl.metrics.projection import MAX_GEN, recognition_tensor
 from etl.metrics.runoff import weekly_runoff
 
@@ -51,18 +53,24 @@ def run_mc(n_paths: int = 2000, as_of=None, seed: int = 0, horizon_weeks: int = 
     Er = rng.choice(empirical_errors(), size=(n_paths, MAX_GEN))
     ren_paths = np.cumprod(1.0 + Er, axis=1) @ ren_base       # (n_paths, n_weeks)
 
-    # --- Layer 3: new business (data-derived center + trend uncertainty + level noise) ---
-    # Center = the damped forecast (no judgment call). Two persistent per-path shocks:
-    #   (1) TREND deviation — the growth rate is only knowable to ±trend_sigma (the history
-    #       implies anywhere from ~+2% to +24%/yr), so we span that; it compounds over years.
-    #   (2) LEVEL error (~±18%) — the one-quarter-ahead run-rate error, held persistent.
-    # Not multiplying independent quarterly shocks (that explodes).
-    nb_base, _, _ = forward_new_weekly(n_weeks)               # damped center
+    # --- Layer 3: new business = PIPELINE (near-term) blended with RUN-RATE (far-term) ---
+    # Run-rate paths (far horizon, where the pipeline is "unborn"): damped center + trend +
+    # level uncertainty, as before.
+    nb_base, _, _ = forward_new_weekly(n_weeks)
     years = np.arange(n_weeks) / 52.0
-    dg = rng.normal(0.0, trend_sigma(), size=n_paths)         # persistent growth deviation
+    dg = rng.normal(0.0, trend_sigma(), size=n_paths)
     growth = np.maximum(1.0 + dg, 0.01)[:, None] ** years[None, :]
-    Eq = rng.choice(newbiz_errors(), size=n_paths)            # persistent level error
-    nb_paths = nb_base[None, :] * growth * (1.0 + Eq[:, None])
+    Eq = rng.choice(newbiz_errors(), size=n_paths)
+    rr_paths = nb_base[None, :] * growth * (1.0 + Eq[:, None])
+    # Pipeline paths (near horizon): resample the backtested weekly booking distribution,
+    # then SMOOTH (the raw pipeline is lumpy month-to-month — hot now, cliff at the horizon;
+    # that lumpiness, not the blend, is what whipsaws the near term). An 8-week moving
+    # average turns it into a believable near-term level.
+    pipe = uniform_filter1d(weekly_booking_samples(n_weeks, seed=seed), size=8, axis=1, mode="nearest")
+    pipe_paths = pipe[rng.integers(0, len(pipe), size=n_paths)]
+    # Blend by the data-derived lead-time weight (bounded weighted average, no valley/hump).
+    w = leadtime_weight(n_weeks)
+    nb_paths = w[None, :] * pipe_paths + (1.0 - w)[None, :] * rr_paths
 
     total_paths = floor[None, :] + ren_paths + nb_paths
     p10, p50, p90 = np.percentile(total_paths, [10, 50, 90], axis=0)

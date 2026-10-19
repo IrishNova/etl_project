@@ -21,7 +21,7 @@ import pandas as pd
 from lifelines import KaplanMeierFitter
 
 from etl.load.db import get_engine
-from etl.metrics.pipeline_timing import sample_remaining
+from etl.metrics.pipeline_timing import fit_stage_kms, km_for, open_deals_asof, sample_remaining
 
 RANK = {"Qualify": 1, "Proposal": 2, "Negotiate": 3, "Contract": 4}
 OPEN_STAGES = set(RANK)
@@ -57,58 +57,26 @@ def _calib_at(opp, hist, T):
     return won, lost
 
 
-def _timing_at(opp, hist, T):
-    stage = _stage_at(hist, T)
-    term = hist[(hist["changed_on"] <= T) & hist["to_stage"].isin(["Won", "Lost"])] \
-        .groupby("opportunity_id")["changed_on"].min()
-    df = opp[opp["created_date"] <= T].copy()
-    df["term"] = term.reindex(df.index)
-    df["stage_at_T"] = stage.reindex(df.index)
-    resolved = df["term"].notna()
-    df["dur"] = np.where(resolved, (df["term"] - df["created_date"]).dt.days,
-                         (T - df["created_date"]).dt.days)
-    df["event"] = resolved.astype(int)
-    df = df[(resolved | df["stage_at_T"].isin(OPEN_STAGES)) & (df["dur"] >= 0)]
-    kms = {}
-    for prod, g in df.groupby("product"):
-        if g["event"].sum() > 5:
-            kms[prod] = KaplanMeierFitter().fit(g["dur"], g["event"])
-    return kms
-
-
-def _open_at(opp, hist, T):
-    stage = _stage_at(hist, T)
-    df = opp.join(stage.rename("stage_at_T"))
-    df = df[df["stage_at_T"].isin(OPEN_STAGES) & (df["created_date"] <= T)].copy()
-    df["rank"] = df["stage_at_T"].map(RANK)
-    df["age"] = (T - df["created_date"]).dt.days.clip(lower=0)
-    return df
-
-
-def _forecast(deals, won, lost, kms, T, rng):
+def _forecast(deals, won, lost, stage_kms, prod_kms, T, rng):
     wdays = (T + pd.DateOffset(months=H_MONTHS) - T).days
     out = np.zeros(N_TRIALS)
-    for prod, g in deals.groupby("product"):
-        if prod not in kms:
+    p_rank = {k: rng.beta(won[k] + 1, lost[k] + 1, size=N_TRIALS) for k in (1, 2, 3, 4)}
+    for (prod, rank), g in deals.groupby(["product", "rank"]):
+        km = km_for(stage_kms, prod_kms, prod, rank)
+        if km is None:
             continue
-        ranks, amt, ages = g["rank"].to_numpy(int), g["amount_usd"].to_numpy(float), g["age"].to_numpy(float)
-        m = len(g)
-        p = np.empty((N_TRIALS, m))
-        for k in (1, 2, 3, 4):
-            col = ranks == k
-            if col.any():
-                p[:, col] = rng.beta(won[k] + 1, lost[k] + 1, size=N_TRIALS)[:, None]
-        win = rng.random((N_TRIALS, m)) < p
-        rem = np.vstack([sample_remaining(kms[prod], ages[j], N_TRIALS, rng) for j in range(m)]).T
+        amt, ages, m = g["amount_usd"].to_numpy(), g["age_in_stage"].to_numpy(), len(g)
+        win = rng.random((N_TRIALS, m)) < p_rank[rank][:, None]
+        rem = np.vstack([sample_remaining(km, ages[j], N_TRIALS, rng) for j in range(m)]).T
         out += ((win & (rem < wdays)) * amt[None, :]).sum(axis=1)
     return out
 
 
 def _actual(deals, won_date, T):
     end = T + pd.DateOffset(months=H_MONTHS)
-    wd = won_date.reindex(deals.index)
+    wd = deals["opportunity_id"].map(won_date)
     won_in = wd.notna() & (wd >= T) & (wd < end)
-    return float(deals.loc[won_in, "amount_usd"].sum())
+    return float(deals.loc[won_in.to_numpy(), "amount_usd"].sum())
 
 
 def _pinball(a, q_levels, q_vals):
@@ -131,12 +99,12 @@ def walk_forward(start="2024-01-01", end="2025-12-01", seed=0) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     rows = []
     for T in pd.date_range(start, end, freq="MS"):
-        deals = _open_at(opp, hist, T)
+        deals = open_deals_asof(opp, hist, T)
         won, lost = _calib_at(opp, hist, T)
-        kms = _timing_at(opp, hist, T)
-        if deals.empty or not kms or min(won[k] + lost[k] for k in (1, 2, 3, 4)) < 20:
+        stage_kms, prod_kms = fit_stage_kms(opp, hist, T)
+        if deals.empty or not (stage_kms or prod_kms) or min(won[k] + lost[k] for k in (1, 2, 3, 4)) < 20:
             continue
-        fc = _forecast(deals, won, lost, kms, T, rng)
+        fc = _forecast(deals, won, lost, stage_kms, prod_kms, T, rng)
         a = _actual(deals, won_date, T)
         p10, p50, p90 = np.percentile(fc, [10, 50, 90])
         rows.append({"T": T.strftime("%Y-%m"), "n_open": len(deals), "actual": a,

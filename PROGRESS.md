@@ -452,9 +452,39 @@ Wired into live forecast (pipeline_forecast applies debias_factor()). Live: P50 
 [$3.62-5.68M]. `debias_factor()` in pipeline_backtest (lru_cached).
 PIPELINE MODEL COMPLETE: calibration -> timing -> MC -> backtest -> debias. Pure statistical.
 
-## NEXT: (5) BLEND near-term pipeline (converts ~2mo, runs dry ~mo3) + far-term run-rate at the
-## reliable horizon -> swap into the new-business layer (pure statistical, replaces hand-tuned).
-## Still pending: Flask API serve projection_series.json.
+## Step 5 BLEND — pipeline swapped into the new-business layer DONE ✅
+- `pipeline_forecast.weekly_booking_samples()` (monthly MC -> smoothed to weekly RATE, /4.35 so
+  partial current month doesn't spike) + `leadtime_weight()` = P(won lead time >= week) from
+  won-deal created->close (w=1 now -> ~0 by week 14, crossover ~wk6 = median cycle; DATA-DERIVED).
+- `band.py` Layer 3 now BLENDS: nb = w*pipeline_paths + (1-w)*run_rate_paths (pipeline resampled
+  per joint MC path). Near-term = backtested pipeline (~$440k/wk bump), far = run-rate. No knobs.
+- Chart re-rendered: smooth near-term pipeline bump handing off to run-rate ~Feb 2027. Clean.
+
+## SANITY CHECK + STAGE-AWARE TIMING + ANOMALY FLAG ✅
+- Sanity-checked the near-term bump: NOT late-stage (only 24% late) and NOT seasonal (data
+  seasonality ~±5%). Root cause: current open pipeline = 591 deals vs 110-295 at every backtest
+  origin (~3.5x) -> forecast faithfully scales up. Likely DATA ARTIFACT (generator stuffed a big
+  open pipeline at the as-of snapshot).
+- STAGE-AWARE TIMING (`pipeline_timing.py` rewritten): KM per (product, stage) on time-from-
+  stage-ENTRY-to-close (from stage_history); open deals draw remaining conditional on in-stage age.
+  Qualify ~35-38d vs Negotiate ~5-21d (early deals close later = correct). forecast + backtest
+  both refactored to group by (product,rank) + km_for fallback. Backtest HOLDS: WAPE 11.6%,
+  bias 0 (debias 0.918), coverage 79%. The fix is a correctness win but did NOT lower the bump
+  (bump is pipeline-SIZE, not timing).
+- DECISION (user): accept the faithful model, DON'T hack it; ADD an ANOMALY FLAG instead.
+  `pipeline_forecast.pipeline_anomaly()` compares current open-deal count to the backtested-range
+  distribution -> level NORMAL/ELEVATED/ANOMALY. chart.py renders an amber caution banner when
+  not NORMAL ("Pipeline 3.5x normal - near-term elevated, treat with caution"). = the circuit-
+  breaker/monitor idea, applied.
+- Chart near-term smoothed (8-wk MA on pipeline, /4.35 rate, bounded weighted-average blend) ->
+  believable Q4 bump -> Q1 lull -> run-rate. No whipsaw.
+- NOTE: new business ~half of total is REAL for this dataset (license-heavy: ~$19M/yr new vs
+  ~$18M/yr active recurring), not a bug. Framing choice available (split one-time out) if wanted.
+
+## ===== FULL PIPELINE-DRIVEN FORECAST COMPLETE =====
+All backtested/reconciled. STILL PENDING/BACKLOG: Flask API serve projection_series.json;
+scheduled projection-refresh cron + circuit-breaker + growth monitors; mock-API data generator;
+support-ticket dataset (parked); multi-step newbiz backtest; opp<->contract crosswalk persist.
 Then front end. BACKLOG ops: nightly/weekly projection-refresh cron (3rd loop) + circuit-breaker
 + "growth falling off" monitor charts. Plus the mock-API data generator (earlier backlog).
 

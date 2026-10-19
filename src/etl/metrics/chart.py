@@ -47,7 +47,7 @@ def emit_json(out: pd.DataFrame) -> None:
     JSON.write_text(json.dumps({"weekly": records}, indent=2))
 
 
-def render(out: pd.DataFrame) -> None:
+def render(out: pd.DataFrame, warning: str | None = None) -> None:
     plt.rcParams.update({"font.size": 10, "hatch.linewidth": 0.6,
                          "axes.edgecolor": MUTED, "text.color": INK})
     x = pd.to_datetime(out["week_start"])
@@ -74,6 +74,9 @@ def render(out: pd.DataFrame) -> None:
                 "backtest-calibrated uncertainty band", xy=(0, 1), xytext=(0, 13),
                 xycoords="axes fraction", textcoords="offset points",
                 fontsize=9, color=MUTED, va="bottom")
+    if warning:
+        ax.annotate(warning, xy=(0, 0.965), xycoords="axes fraction", fontsize=9,
+                    color="#b45309", fontweight="bold")  # amber caution
 
     ax.yaxis.set_major_formatter(lambda v, _: f"${v/1000:,.0f}k")
     ax.set_ylabel("Recognized revenue / week", color=MUTED)
@@ -97,7 +100,13 @@ def render(out: pd.DataFrame) -> None:
 
 
 if __name__ == "__main__":
+    from etl.metrics.pipeline_forecast import pipeline_anomaly
+
     out, _, _ = run_mc()
     emit_json(out)
-    render(out)
+    a = pipeline_anomaly()
+    warn = (f"⚠ Pipeline {a['ratio']:.1f}x normal — near-term elevated, treat with caution"
+            if a["level"] != "NORMAL" else None)
+    render(out, warning=warn)
     print(f"wrote {PNG.relative_to(ROOT)}  and  {JSON.relative_to(ROOT)}")
+    print(f"pipeline anomaly: {a['level']}  (now {a['now']} open, typical ~{a['median']}, max {a['max']})")
