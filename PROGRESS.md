@@ -481,6 +481,31 @@ PIPELINE MODEL COMPLETE: calibration -> timing -> MC -> backtest -> debias. Pure
 - NOTE: new business ~half of total is REAL for this dataset (license-heavy: ~$19M/yr new vs
   ~$18M/yr active recurring), not a bug. Framing choice available (split one-time out) if wanted.
 
+## C-SUITE DASHBOARD METRICS (new workstream)
+Menu (data-supported): ARR bridge, NRR/GRR, churn (logo+$), customer logos, revenue
+concentration (top-N), new bookings/win-rate, revenue+retention by product/region, cohort
+retention. CANT do: CAC/LTV/margins/Rule-of-40 (no cost/target data).
+- ARR BRIDGE DONE ✅ (`src/etl/metrics/arr_bridge.py`): start + new + expansion - contraction
+  - churn = end, ONE consistent predecessor->successor pairing (_pairs) so it reconciles
+  (residual 0.1%). Trailing-12mo: $14.6M -> $18.6M (new +5.5, exp +1.0, contr -0.9, churn -1.7);
+  GRR 83% NRR 89%. Waterfall chart -> reports/arr_bridge.png (validated palette, direct labels).
+  LESSON (again): two different renewal definitions (reconstruct vs _mark_renewal) broke
+  reconciliation ($2.5M residual) -> unified to one pairing -> 0.1%.
+- 3 MORE DASHBOARD METRICS DONE ✅ (`src/etl/metrics/dashboard.py`): retention_trend (GRR/NRR
+  by expiry quarter), concentration (top-N ARR share -> reports/concentration.png; Zenith =
+  ~15% of ARR = risk flag), logos (new vs churned per quarter; new-logo acquisition slowing).
+  Reuse arr_bridge._pairs. Charts: reports/retention_trend.png, concentration.png, logos.png.
+- Dashboard charts so far: projection, arr_bridge, retention_trend, concentration, logos.
+- LAST 3 DASHBOARD METRICS DONE ✅ (`dashboard.py`): cohort_retention (logo retention heatmap by
+  signing cohort x quarters-since; Q0 bug fixed -> measure at quarter END), revenue_mix (active ARR
+  by product x region stacked; B=$15M dominates, C absent=one-time), bookings_winrate (2 subplots:
+  bookings $/qtr bars + win-rate line, no dual-axis). -> reports/cohort_retention.png, revenue_mix.png,
+  bookings_winrate.png.
+- DASHBOARD COMPLETE: 8 charts = projection + arr_bridge + retention_trend + concentration + logos
+  + cohort_retention + revenue_mix + bookings_winrate. All data-supported metrics built.
+- Key exec insights surfaced: Zenith ~15% of ARR (concentration risk); NRR>GRR (expansion);
+  new-logo acquisition slowing; bookings growing + win-rate improving; base very sticky (cohort).
+
 ## ===== FULL PIPELINE-DRIVEN FORECAST COMPLETE =====
 All backtested/reconciled. STILL PENDING/BACKLOG: Flask API serve projection_series.json;
 scheduled projection-refresh cron + circuit-breaker + growth monitors; mock-API data generator;
