@@ -9,7 +9,7 @@ idea of who a "customer" is, are extracted, cleaned, entity-resolved into a Post
 schema, and turned into retention, concentration, and a three-layer revenue projection with
 a Monte-Carlo uncertainty band.
 
-- **Live walk-through & interactive dashboard:** [ryansportfolio.net]([https://ryansportfolio.net](https://ryansportfolio.net/login))
+- **Live walk-through & interactive dashboard:** [ryansportfolio.net](https://ryansportfolio.net/login)]
 - **Methodology & design decisions:** [`docs/methodology.md`](docs/methodology.md) — every
   analytical choice (recognition basis, GRR vs NRR, censoring/maturation lag, pipeline
   calibration, backtesting) with the evidence behind it.
